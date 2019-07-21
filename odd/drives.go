@@ -1,6 +1,6 @@
 package odd
 
-// *Optical Disc Drive
+// TODO: rewrite everything, get rid of this ugly & dangerous mutex rigmarole
 
 /*
 #cgo LDFLAGS: -lcdio -lcdio_cdda -lcdio_paranoia
@@ -16,7 +16,7 @@ package odd
 #include <gio/gio.h>
 #include <gobject/gsignal.h>
 
-uint8_t countDrives(char **drives);
+uint8_t countDrives(char *drives[]);
 void VolumeRemovedCB(GVolumeMonitor *vm, GVolume *v, gpointer p);
 void VolumeAddedCB(GVolumeMonitor *vm, GVolume *v, gpointer p);
 */
@@ -29,25 +29,32 @@ import (
 )
 
 type (
-	Drive struct {
-		Path string
-		Name string
-
-		d     *C.cdrom_drive_t
-		media bool // whether an Audio CD is currently present in drive. yes, there's cdrom_drive_t.opened...
-	}
-
 	Track struct {
 		Num        uint8
 		Duration   time.Duration
 		Emphasis   bool
 		CopyPermit bool
+
+		drive *Drive
+	}
+
+	Tracks []*Track
+
+	Drive struct {
+		Path   string
+		Name   string
+		Tracks Tracks
+
+		d        *C.cdrom_drive_t
+		hasMedia bool // whether an Audio CD is currently present in drive. yes, there's cdrom_drive_t.opened...
 	}
 
 	// Drives is a simple map of Drive struct pointers, keyed with drive paths
 	Drives map[string]*Drive
+)
 
-	Tracks []*Track
+const (
+	twoSecs = 150
 )
 
 var (
@@ -57,7 +64,7 @@ var (
 	cb func(string, bool)
 
 	// contains all drives returned with the last Get()
-	returnedDrives Drives
+	availableDrives Drives
 )
 
 //export VolumeRemovedCB
@@ -67,8 +74,8 @@ func VolumeRemovedCB(_ *C.GVolumeMonitor, v *C.GVolume, _ C.gpointer) {
 
 	path := gvolume2Path(v)
 
-	if drive, found := returnedDrives[path]; found && cb != nil {
-		drive.media = false
+	if drive, found := availableDrives[path]; found && cb != nil {
+		drive.hasMedia = false
 		cb(path, false)
 	}
 }
@@ -80,15 +87,16 @@ func VolumeAddedCB(_ *C.GVolumeMonitor, v *C.GVolume, _ C.gpointer) {
 
 	path := gvolume2Path(v)
 
-	if drive, found := returnedDrives[path]; found {
+	if drive, found := availableDrives[path]; found {
 		if drive.initMedia() && /*must be last*/ cb != nil {
 			cb(path, true)
 		}
 	}
 }
 
+// TODO: this is not nice, is it? Create an Init() func, to be called early in main()
 func init() {
-	returnedDrives = make(Drives)
+	availableDrives = make(Drives)
 
 	loop := C.g_main_loop_new(nil, C.FALSE)
 	// defer C.g_main_loop_unref(loop)
@@ -111,15 +119,15 @@ func init() {
 }
 
 // Get returns all optical drives available on the system as a map keyed with their unix paths
-// onChange() is called when an audio CD is either removed or inserted.
-// media == true indicates media changed into valid Audio CD
-// onChange() must not call any methods on any Drive object directly
+// mediaChange() is called when an audio CD is either removed or inserted.
+// hasMedia == true indicates hasMedia changed into valid Audio CD
+// mediaChange() must not call any methods on any Drive object directly
 func Get(mediaChange func(path string, media bool)) Drives {
 	m.Lock()
 	defer m.Unlock()
 
-	if len(returnedDrives) != 0 {
-		panic("Every Get() call must be preceded with Destroy()ction for all Get()ed drives")
+	if len(availableDrives) != 0 {
+		panic("Every Get() call must be preceded with Destroy()ction for all Get()ed Drives")
 	}
 
 	devicesCArray := C.cdio_get_devices(C.DRIVER_DEVICE)
@@ -140,7 +148,7 @@ func Get(mediaChange func(path string, media bool)) Drives {
 
 		path := C.GoString(tmp.cdda_device_name)
 		drives[path] = &Drive{d: tmp, Path: path, Name: C.GoString(tmp.drive_model)}
-		returnedDrives[path] = drives[path]
+		availableDrives[path] = drives[path]
 		cb = mediaChange
 
 		// parallelize initMedia() 4 fun
@@ -148,7 +156,7 @@ func Get(mediaChange func(path string, media bool)) Drives {
 		go func() {
 			defer wg.Done()
 
-			returnedDrives[path].initMedia()
+			availableDrives[path].initMedia()
 		}()
 	}
 
@@ -170,16 +178,31 @@ func gvolume2Path(volume *C.GVolume) string {
 	return C.GoString(C.g_volume_get_identifier(volume, C.CString(C.G_DRIVE_IDENTIFIER_KIND_UNIX_DEVICE))) // deprecated, whatever
 }
 
-// cdparanoia verifies for us whether the inserted disc is CDDA
+// this func is also used to verify whether the inserted disc is CDDA
 func (drive *Drive) initMedia() bool {
-	drive.media = C.cdio_cddap_open(drive.d) == 0
+	drive.hasMedia = C.cdio_cddap_open(drive.d) == 0
 
-	return drive.media
+	drive.Tracks = drive.tracks()
+
+	return drive.hasMedia
 }
 
-// Tracks returns a slice of Track structs
-func (drive *Drive) Tracks() Tracks {
-	msfDuration := func(i uint8, msf *C.msf_t) time.Duration {
+func (drive *Drive) firstLastIndices() (firstIndex, lastIndex uint8) {
+	totalTracks := drive.numOfTracks()
+	if totalTracks == 0 {
+		return 0, 0
+	}
+
+	first := uint8(C.cdio_get_first_track_num(drive.d.p_cdio))
+	firstIndex = 1 - first
+	lastIndex = totalTracks - first
+
+	return
+}
+
+// returns a slice of Track structs
+func (drive *Drive) tracks() Tracks {
+	msfDuration := func(i uint8, msf *C.msf_t) time.Duration { // TODO: isn't there a helper func like this in the C libs already, sector.h?
 		deBCD := func(b C.uchar) time.Duration {
 			return time.Duration(((b&0xF0)>>4)*10 + (b & 0x0F))
 		}
@@ -192,26 +215,19 @@ func (drive *Drive) Tracks() Tracks {
 		seconds := deBCD(msf.s)
 		frames := deBCD(msf.f)
 
-		return time.Minute * minutes + time.Second * seconds + time.Second / 75 * frames
+		return time.Minute*minutes + time.Second*seconds + time.Second/75*frames
 	}
 
-	m.Lock()
-	defer m.Unlock()
-
-	totalTracks := drive.numOfTracks()
-	if totalTracks == 0 {
+	firstIndex, lastIndex := drive.firstLastIndices()
+	if lastIndex == 0 {
 		return nil
 	}
-
-	first := uint8(C.cdio_get_first_track_num(drive.d.p_cdio))
-	firstIndex := 1 - first
-	lastIndex := totalTracks - first
 
 	var tracks Tracks
 	msf := new(C.msf_t)
 	startOfCurrent := msfDuration(firstIndex, msf)
 	for i := firstIndex; i <= lastIndex; i++ {
-		startOfNext := msfDuration(i+1, msf) // last_track+1 is the "leadout" track
+		startOfNext := msfDuration(i+1, msf) // lastIndex+1 is the "leadout" track
 		preemphasis := C.cdio_get_track_preemphasis(drive.d.p_cdio, C.uchar(i)) == C.CDIO_TRACK_FLAG_TRUE
 		copyPermit := C.cdio_get_track_copy_permit(drive.d.p_cdio, C.uchar(i)) == C.CDIO_TRACK_FLAG_TRUE
 
@@ -221,6 +237,7 @@ func (drive *Drive) Tracks() Tracks {
 				Duration:   startOfNext - startOfCurrent,
 				Emphasis:   preemphasis,
 				CopyPermit: copyPermit,
+				drive:      drive,
 			})
 
 		startOfCurrent = startOfNext
@@ -229,10 +246,31 @@ func (drive *Drive) Tracks() Tracks {
 	return tracks
 }
 
+func (track Track) offset() uint32 {
+	s := C.cdio_cddap_track_firstsector(track.drive.d, C.uchar(track.Num))
+
+	return uint32(s) + twoSecs
+}
+
+// returns the leadout track sector offset, 0 on error
+func (drive *Drive) leadOutTrackOffset() uint32 {
+	last := len(drive.Tracks) - 1
+
+	s := C.cdio_cddap_track_firstsector(drive.d, C.uchar(drive.Tracks[last].Num+1)) // Num+1 is the "leadout" track
+	if s == -1 { // TODO: does it really return -1 on error?
+		return 0
+	}
+
+	return uint32(s) + twoSecs
+}
+
 // Open the drive tray
 func (drive *Drive) Open() {
 	m.Lock()
 	defer m.Unlock()
+	if drive.d == nil {
+		return
+	}
 
 	C.cdio_eject_media_drive(drive.d.cdda_device_name)
 }
@@ -241,6 +279,9 @@ func (drive *Drive) Open() {
 func (drive *Drive) Close() {
 	m.Lock()
 	defer m.Unlock()
+	if drive.d == nil { // drive obj got Destroy()ed while we waited for Lock()
+		return
+	}
 
 	C.cdio_close_tray(drive.d.cdda_device_name, nil)
 }
@@ -249,13 +290,35 @@ func (drive *Drive) Close() {
 func (drive *Drive) NumOfTracks() uint8 {
 	m.Lock()
 	defer m.Unlock()
+	if !drive.hasMedia /*disc removed*/ || drive.d == nil /*drive obj got Destroy()ed*/ {
+		return 0
+	}
 
 	return drive.numOfTracks()
 }
 
+// Sectors returns the number of sectors on current disc. Returns 0 on error
+func (drive *Drive) Sectors() uint32 {
+	m.Lock()
+	defer m.Unlock()
+	if !drive.hasMedia /*disc removed*/ || drive.d == nil /*drive obj got Destroy()ed*/ {
+		return 0
+	}
+
+	fs := int32(C.cdio_cddap_disc_firstsector(drive.d)) // typedef int32_t lsn_t
+	ls := int32(C.cdio_cddap_disc_lastsector(drive.d))
+
+	if fs == -1 || ls == -1 {
+		return 0
+	}
+
+	return uint32(ls - fs + 1)
+	// return drive.leadOutTrackOffset() - twoSecs // same
+}
+
 // same as NumOfTracks but without mutex
 func (drive *Drive) numOfTracks() uint8 {
-	if !drive.media {
+	if !drive.hasMedia {
 		return 0
 	}
 
@@ -267,8 +330,12 @@ func (drive *Drive) Destroy() {
 	m.Lock()
 	defer m.Unlock()
 
-	delete(returnedDrives, drive.Path)
-	if len(returnedDrives) == 0 {
+	if drive.d == nil {
+		panic("attempt to Destroy() the same Drive consecutively")
+	}
+
+	delete(availableDrives, drive.Path)
+	if len(availableDrives) == 0 { // whether we just removed the last remaining drive
 		cb = nil
 	}
 
@@ -277,6 +344,7 @@ func (drive *Drive) Destroy() {
 	drive.d = nil
 	drive.Path = ""
 	drive.Name = ""
+	drive.Tracks = nil
 }
 
 // Destroy releases the drive object resources inside the Drives map

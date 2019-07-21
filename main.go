@@ -27,6 +27,8 @@ func main() {
 		fmt.Printf("name: %s\n", d.Name)
 		fmt.Printf("path: %s\n", d.Path)
 		fmt.Printf("tracks: %d\n", d.NumOfTracks())
+		fmt.Printf("sectors: %d\n", d.Sectors())
+		fmt.Printf("DiscID: %s\n", d.CalcDiscID())
 
 		// d.Open()
 		// time.Sleep(time.Second * 2)
@@ -41,16 +43,16 @@ func main() {
 	// 	time.Sleep(time.Second)
 	// }
 
-	tracks := drives["/dev/sr0"].Tracks()
+	tracks := drives["/dev/sr0"].Tracks
 	if tracks == nil {
 		fmt.Println("umm no tracks")
 	}
 
 	for _, t := range tracks {
-		fmt.Printf("%v\n", t) // %+v
+		fmt.Printf("%+v\n", t) // %+v
 	}
 
-	// tracks = drives["/dev/sr1"].Tracks()
+	// tracks = drives["/dev/sr1"].Tracks
 	// if tracks == nil {
 	// 	fmt.Println("umm no tracks")
 	// }
