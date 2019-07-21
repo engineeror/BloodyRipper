@@ -171,7 +171,7 @@ func Get(mediaChange func(path string, media bool)) Drives {
 
 func deviceList2Slice(cArray **C.char) []*C.char {
 	deviceCount := uint8(C.countDrives(cArray))
-	return (*[0xff]*C.char)(unsafe.Pointer(cArray))[:deviceCount:deviceCount /*capacity*/ ]
+	return (*[0xff]*C.char)(unsafe.Pointer(cArray))[:deviceCount:deviceCount /*capacity*/]
 }
 
 func gvolume2Path(volume *C.GVolume) string {
@@ -246,7 +246,7 @@ func (drive *Drive) tracks() Tracks {
 	return tracks
 }
 
-func (track Track) offset() uint32 {
+func (track *Track) offset() uint32 {
 	s := C.cdio_cddap_track_firstsector(track.drive.d, C.uchar(track.Num))
 
 	return uint32(s) + twoSecs
@@ -257,7 +257,7 @@ func (drive *Drive) leadOutTrackOffset() uint32 {
 	last := len(drive.Tracks) - 1
 
 	s := C.cdio_cddap_track_firstsector(drive.d, C.uchar(drive.Tracks[last].Num+1)) // Num+1 is the "leadout" track
-	if s == -1 { // TODO: does it really return -1 on error?
+	if s == -1 {                                                                    // TODO: does it really return -1 on error?
 		return 0
 	}
 
