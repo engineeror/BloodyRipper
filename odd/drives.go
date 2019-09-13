@@ -1,6 +1,7 @@
 package odd
 
 // TODO: rewrite everything, get rid of this ugly & dangerous mutex rigmarole
+// rewrite to use a map of drives and etc, map index by time.Now() @ disc init
 
 /*
 #cgo LDFLAGS: -lcdio -lcdio_cdda -lcdio_paranoia
@@ -23,14 +24,31 @@ void VolumeAddedCB(GVolumeMonitor *vm, GVolume *v, gpointer p);
 import "C"
 
 import (
+	"crypto/sha1"
+	"encoding/base64"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
 )
 
 type (
+	Drive struct {
+		Path string
+		Name string
+
+		tracks   Tracks
+		d        *C.cdrom_drive_t
+		hasMedia bool // whether an Audio CD is currently present in drive. yes, there's cdrom_drive_t.opened...
+	}
+
+	// Drives is a simple map of Drive struct pointers, keyed with drive paths
+	Drives map[string]*Drive
+
 	Track struct {
-		Num        uint8
+		Num uint8
+
 		Duration   time.Duration
 		Emphasis   bool
 		CopyPermit bool
@@ -39,18 +57,6 @@ type (
 	}
 
 	Tracks []*Track
-
-	Drive struct {
-		Path   string
-		Name   string
-		Tracks Tracks
-
-		d        *C.cdrom_drive_t
-		hasMedia bool // whether an Audio CD is currently present in drive. yes, there's cdrom_drive_t.opened...
-	}
-
-	// Drives is a simple map of Drive struct pointers, keyed with drive paths
-	Drives map[string]*Drive
 )
 
 const (
@@ -59,7 +65,7 @@ const (
 
 var (
 	// prevents g_main_loop racing against caller
-	m sync.Mutex
+	mut sync.Mutex
 	// Media change callbacks
 	cb func(string, bool)
 
@@ -69,8 +75,8 @@ var (
 
 //export VolumeRemovedCB
 func VolumeRemovedCB(_ *C.GVolumeMonitor, v *C.GVolume, _ C.gpointer) {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 
 	path := gvolume2Path(v)
 
@@ -82,8 +88,8 @@ func VolumeRemovedCB(_ *C.GVolumeMonitor, v *C.GVolume, _ C.gpointer) {
 
 //export VolumeAddedCB
 func VolumeAddedCB(_ *C.GVolumeMonitor, v *C.GVolume, _ C.gpointer) {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 
 	path := gvolume2Path(v)
 
@@ -123,8 +129,8 @@ func init() {
 // hasMedia == true indicates hasMedia changed into valid Audio CD
 // mediaChange() must not call any methods on any Drive object directly
 func Get(mediaChange func(path string, media bool)) Drives {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 
 	if len(availableDrives) != 0 {
 		panic("Every Get() call must be preceded with Destroy()ction for all Get()ed Drives")
@@ -171,7 +177,7 @@ func Get(mediaChange func(path string, media bool)) Drives {
 
 func deviceList2Slice(cArray **C.char) []*C.char {
 	deviceCount := uint8(C.countDrives(cArray))
-	return (*[0xff]*C.char)(unsafe.Pointer(cArray))[:deviceCount:deviceCount /*capacity*/]
+	return (*[0xff]*C.char)(unsafe.Pointer(cArray))[:deviceCount:deviceCount /*capacity*/ ]
 }
 
 func gvolume2Path(volume *C.GVolume) string {
@@ -182,7 +188,7 @@ func gvolume2Path(volume *C.GVolume) string {
 func (drive *Drive) initMedia() bool {
 	drive.hasMedia = C.cdio_cddap_open(drive.d) == 0
 
-	drive.Tracks = drive.tracks()
+	drive.tracks = drive.getTracks()
 
 	return drive.hasMedia
 }
@@ -201,7 +207,7 @@ func (drive *Drive) firstLastIndices() (firstIndex, lastIndex uint8) {
 }
 
 // returns a slice of Track structs
-func (drive *Drive) tracks() Tracks {
+func (drive *Drive) getTracks() Tracks {
 	msfDuration := func(i uint8, msf *C.msf_t) time.Duration { // TODO: isn't there a helper func like this in the C libs already, sector.h?
 		deBCD := func(b C.uchar) time.Duration {
 			return time.Duration(((b&0xF0)>>4)*10 + (b & 0x0F))
@@ -254,10 +260,10 @@ func (track *Track) offset() uint32 {
 
 // returns the leadout track sector offset, 0 on error
 func (drive *Drive) leadOutTrackOffset() uint32 {
-	last := len(drive.Tracks) - 1
+	last := len(drive.tracks) - 1
 
-	s := C.cdio_cddap_track_firstsector(drive.d, C.uchar(drive.Tracks[last].Num+1)) // Num+1 is the "leadout" track
-	if s == -1 {                                                                    // TODO: does it really return -1 on error?
+	s := C.cdio_cddap_track_firstsector(drive.d, C.uchar(drive.tracks[last].Num+1)) // Num+1 is the "leadout" track
+	if s == -1 { // TODO: does it really return -1 on error?
 		return 0
 	}
 
@@ -266,8 +272,8 @@ func (drive *Drive) leadOutTrackOffset() uint32 {
 
 // Open the drive tray
 func (drive *Drive) Open() {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 	if drive.d == nil {
 		return
 	}
@@ -277,8 +283,8 @@ func (drive *Drive) Open() {
 
 // Close the drive tray
 func (drive *Drive) Close() {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 	if drive.d == nil { // drive obj got Destroy()ed while we waited for Lock()
 		return
 	}
@@ -288,8 +294,8 @@ func (drive *Drive) Close() {
 
 // NumOfTracks returns the number of numOfTracks on the drive
 func (drive *Drive) NumOfTracks() uint8 {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 	if !drive.hasMedia /*disc removed*/ || drive.d == nil /*drive obj got Destroy()ed*/ {
 		return 0
 	}
@@ -299,8 +305,8 @@ func (drive *Drive) NumOfTracks() uint8 {
 
 // Sectors returns the number of sectors on current disc. Returns 0 on error
 func (drive *Drive) Sectors() uint32 {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 	if !drive.hasMedia /*disc removed*/ || drive.d == nil /*drive obj got Destroy()ed*/ {
 		return 0
 	}
@@ -327,8 +333,8 @@ func (drive *Drive) numOfTracks() uint8 {
 
 // Destroy releases the drive object resources
 func (drive *Drive) Destroy() {
-	m.Lock()
-	defer m.Unlock()
+	mut.Lock()
+	defer mut.Unlock()
 
 	if drive.d == nil {
 		panic("attempt to Destroy() the same Drive consecutively")
@@ -344,7 +350,7 @@ func (drive *Drive) Destroy() {
 	drive.d = nil
 	drive.Path = ""
 	drive.Name = ""
-	drive.Tracks = nil
+	drive.tracks = nil
 }
 
 // Destroy releases the drive object resources inside the Drives map
@@ -352,4 +358,59 @@ func (drives Drives) Destroy() {
 	for _, d := range drives {
 		d.Destroy()
 	}
+}
+
+// CalcDiscID calculates the musicbrainz Disc ID https://wiki.musicbrainz.org/Disc_ID_Calculation#Calculating_the_Disc_ID
+func (drive *Drive) CalcDiscID() (string, error) {
+	const fail = "DiscID calculation failed: %s"
+
+	num := uint8(len(drive.tracks))
+	h := sha1.New()
+
+	_, err := fmt.Fprintf(h, "%02X", drive.tracks[0].Num)
+	if err != nil {
+		return "", fmt.Errorf(fail, err)
+	}
+
+	_, err = fmt.Fprintf(h, "%02X", drive.tracks[num-1].Num)
+	if err != nil {
+		return "", fmt.Errorf(fail, err)
+	}
+
+	_, err = fmt.Fprintf(h, "%08X", drive.leadOutTrackOffset())
+	if err != nil {
+		return "", fmt.Errorf(fail, err)
+	}
+
+	n := uint8(0)
+	for ; n < num; n++ {
+		_, err = fmt.Fprintf(h, "%08X", drive.tracks[n].offset())
+		if err != nil {
+			return "", fmt.Errorf(fail, err)
+		}
+	}
+	for ; n < 99; n++ {
+		_, err = fmt.Fprintf(h, "%08X", 0)
+		if err != nil {
+			return "", fmt.Errorf(fail, err)
+		}
+	}
+
+	sum := h.Sum(nil)
+	b := strings.Builder{}
+
+	encoder := base64.NewEncoder(base64.StdEncoding, &b)
+	_, err = encoder.Write(sum)
+	if err != nil {
+		return "", fmt.Errorf(fail, err)
+	}
+
+	err = encoder.Close() // maybe b contains the disc id even if this fails?
+	if err != nil {
+		return "", fmt.Errorf(fail, err)
+	}
+
+	r := strings.NewReplacer("+", ".", "/", "_", "=", "-") // I don't think go lib can produce the musicbrainz format directly
+
+	return r.Replace(b.String()), nil
 }

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 
+	"main/metadata"
 	"main/odd"
 )
 
@@ -28,38 +31,19 @@ func main() {
 		fmt.Printf("path: %s\n", d.Path)
 		fmt.Printf("tracks: %d\n", d.NumOfTracks())
 		fmt.Printf("sectors: %d\n", d.Sectors())
-		fmt.Printf("DiscID: %s\n", d.CalcDiscID())
 
-		// d.Open()
-		// time.Sleep(time.Second * 2)
-		// d.Close()
-		// time.Sleep(time.Second * 5)
-		// fmt.Println()
+		discid, err := d.CalcDiscID()
+		albums, _ := metadata.QueryMusicBrainz(discid)
+		if err != nil {
+			fmt.Printf("umm no metadata: %s\n", err)
+		}
+
+		data, err := json.MarshalIndent(albums, "", "  ")
+		if err != nil {
+			log.Fatalf("JSON marshaling failed: %s", err)
+		}
+		fmt.Printf("%s\n", data)
 	}
-
-	// for {
-	// 	fmt.Printf("tracks0 %d\n", drives["/dev/sr0"].NumOfTracks())
-	// 	fmt.Printf("tracks1 %d\n", drives["/dev/sr1"].NumOfTracks())
-	// 	time.Sleep(time.Second)
-	// }
-
-	tracks := drives["/dev/sr0"].Tracks
-	if tracks == nil {
-		fmt.Println("umm no tracks")
-	}
-
-	for _, t := range tracks {
-		fmt.Printf("%+v\n", t) // %+v
-	}
-
-	// tracks = drives["/dev/sr1"].Tracks
-	// if tracks == nil {
-	// 	fmt.Println("umm no tracks")
-	// }
-	//
-	// for _, t := range tracks {
-	// 	fmt.Printf("%+v\n", t)
-	// }
 
 	drives.Destroy()
 }
